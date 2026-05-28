@@ -132,6 +132,7 @@ const registerMSTeamsHandlers = vi.hoisted(() =>
 );
 const isSigninInvokeAuthorized = vi.hoisted(() => vi.fn(async () => true));
 const isCardActionInvokeAuthorized = vi.hoisted(() => vi.fn(async () => true));
+const runMSTeamsFileConsentInvokeHandler = vi.hoisted(() => vi.fn(async () => {}));
 const loadMSTeamsSdkWithAuth = vi.hoisted(() =>
   vi.fn(async (_creds?: unknown, _options?: unknown) => ({
     app: {
@@ -162,6 +163,10 @@ vi.mock("./monitor-handler.js", () => ({
   isCardActionInvokeAuthorized,
   isSigninInvokeAuthorized,
   registerMSTeamsHandlers,
+}));
+
+vi.mock("./file-consent-invoke.js", () => ({
+  runMSTeamsFileConsentInvokeHandler,
 }));
 
 const resolveAllowlistMocks = vi.hoisted(() => ({
@@ -279,6 +284,7 @@ describe("monitorMSTeamsProvider lifecycle", () => {
     resolveAllowlistMocks.resolveMSTeamsUserAllowlist.mockReset().mockResolvedValue([]);
     isSigninInvokeAuthorized.mockReset().mockResolvedValue(true);
     isCardActionInvokeAuthorized.mockReset().mockResolvedValue(true);
+    runMSTeamsFileConsentInvokeHandler.mockReset().mockResolvedValue(undefined);
     ssoTokenStore.get.mockClear();
     ssoTokenStore.save.mockClear();
     ssoTokenStore.remove.mockClear();
@@ -674,6 +680,101 @@ describe("monitorMSTeamsProvider lifecycle", () => {
     const run = vi.spyOn(registeredHandler, "run");
     await activityHandler({ activity });
     expect(run).toHaveBeenCalledWith(expect.objectContaining({ activity }));
+
+    abort.abort();
+    await task;
+  });
+
+  it("acks file-consent invokes before upload work settles", async () => {
+    let releaseUpload: (() => void) | undefined;
+    const uploadWork = new Promise<void>((resolve) => {
+      releaseUpload = resolve;
+    });
+    runMSTeamsFileConsentInvokeHandler.mockReturnValueOnce(uploadWork);
+
+    const abort = new AbortController();
+    const task = monitorMSTeamsProvider({
+      cfg: createConfig(0),
+      runtime: createRuntime(),
+      abortSignal: abort.signal,
+      conversationStore: createStores().conversationStore,
+      pollStore: createStores().pollStore,
+    });
+
+    await vi.waitFor(() => {
+      expect(registerMSTeamsHandlers).toHaveBeenCalled();
+    });
+
+    const sdkResultPromise = loadMSTeamsSdkWithAuth.mock.results[0]?.value;
+    if (!sdkResultPromise) {
+      throw new Error("expected loadMSTeamsSdkWithAuth result");
+    }
+    const app = (await sdkResultPromise).app;
+    const fileConsentHandler = app.on.mock.calls.find(
+      (call: [string, unknown]) => call[0] === "file.consent.accept",
+    )?.[1];
+    if (typeof fileConsentHandler !== "function") {
+      throw new Error("expected file consent accept handler");
+    }
+
+    expect(fileConsentHandler({ activity: { type: "invoke", name: "fileConsent/invoke" } })).toBe(
+      undefined,
+    );
+    expect(runMSTeamsFileConsentInvokeHandler).toHaveBeenCalledTimes(1);
+    releaseUpload?.();
+    await uploadWork;
+
+    abort.abort();
+    await task;
+  });
+
+  it("acks non-poll card actions before agent dispatch settles", async () => {
+    const abort = new AbortController();
+    const task = monitorMSTeamsProvider({
+      cfg: createConfig(0),
+      runtime: createRuntime(),
+      abortSignal: abort.signal,
+      conversationStore: createStores().conversationStore,
+      pollStore: createStores().pollStore,
+    });
+
+    await vi.waitFor(() => {
+      expect(registerMSTeamsHandlers).toHaveBeenCalled();
+    });
+
+    const sdkResultPromise = loadMSTeamsSdkWithAuth.mock.results[0]?.value;
+    if (!sdkResultPromise) {
+      throw new Error("expected loadMSTeamsSdkWithAuth result");
+    }
+    const app = (await sdkResultPromise).app;
+    const cardActionHandler = app.on.mock.calls.find(
+      (call: [string, unknown]) => call[0] === "card.action",
+    )?.[1];
+    if (typeof cardActionHandler !== "function") {
+      throw new Error("expected card.action handler");
+    }
+    const registeredHandler = registerMSTeamsHandlers.mock.calls[0]?.[0];
+    if (!registeredHandler) {
+      throw new Error("expected registered Teams handler");
+    }
+    let releaseDispatch: (() => void) | undefined;
+    const dispatchWork = new Promise<void>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    const run = vi.spyOn(registeredHandler, "run").mockReturnValueOnce(dispatchWork);
+
+    const response = await cardActionHandler({
+      activity: {
+        type: "invoke",
+        name: "adaptiveCard/action",
+        value: { action: { data: { action: "nonPoll" } } },
+      },
+    });
+
+    expect(response).toMatchObject({ statusCode: 200, value: "OK" });
+    expect(run).toHaveBeenCalledTimes(1);
+    releaseDispatch?.();
+    await dispatchWork;
 
     abort.abort();
     await task;

@@ -447,9 +447,11 @@ export async function monitorMSTeamsProvider(
           };
         }
       }
-      // Non-poll card actions: acknowledge silently and let the activity
-      // catch-all dispatch the action data to the agent if applicable.
-      await handler.run!(adaptedCtx);
+      // Non-poll card actions may dispatch into the agent. Acknowledge the
+      // invoke immediately so Teams does not time out while that work runs.
+      void handler.run!(adaptedCtx).catch((err: unknown) => {
+        log.error("msteams card.action dispatch failed", { error: formatUnknownError(err) });
+      });
       return {
         statusCode: 200,
         type: "application/vnd.microsoft.activity.message",
@@ -474,11 +476,11 @@ export async function monitorMSTeamsProvider(
   // old `ctx.sendActivity({ type: "invokeResponse" })` shape no longer
   // works on the new SDK because that ctx call becomes an outbound BF
   // activity instead of the HTTP response (Brad #2 / codex #4).
-  app.on("file.consent.accept", async (ctx) => {
-    await runMSTeamsFileConsentInvokeHandler(adaptSdkContext(ctx, app), log);
+  app.on("file.consent.accept", (ctx) => {
+    void runMSTeamsFileConsentInvokeHandler(adaptSdkContext(ctx, app), log);
   });
-  app.on("file.consent.decline", async (ctx) => {
-    await runMSTeamsFileConsentInvokeHandler(adaptSdkContext(ctx, app), log);
+  app.on("file.consent.decline", (ctx) => {
+    void runMSTeamsFileConsentInvokeHandler(adaptSdkContext(ctx, app), log);
   });
 
   const handleSdkSigninInvoke = async (

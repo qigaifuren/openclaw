@@ -131,10 +131,9 @@ async function handleMSTeamsFileConsentInvoke(
 }
 
 /**
- * Run the file-consent invoke handler. The HTTP 200 InvokeResponse is sent by
- * the SDK once this returns — a void/undefined return from a typed
- * `app.on("file.consent.accept|decline")` handler is wrapped to
- * `{ status: 200 }`, so this function intentionally does not ack itself.
+ * Run the file-consent invoke handler after the SDK route has acknowledged the
+ * invoke. This intentionally does not send its own invokeResponse; it only does
+ * the delayed upload/update work.
  */
 export async function runMSTeamsFileConsentInvokeHandler(
   context: MSTeamsTurnContext,
