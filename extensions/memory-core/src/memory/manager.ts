@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { FSWatcher } from "chokidar";
+import type { FSWatcher } from "chokidar-slim";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import {
   createSubsystemLogger,
@@ -185,7 +185,6 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
   protected override sessionWatchTimer: NodeJS.Timeout | null = null;
   protected override sessionUnsubscribe: (() => void) | null = null;
   protected override intervalTimer: NodeJS.Timeout | null = null;
-  protected override memoryWatchPressureStartupTimer: NodeJS.Timeout | null = null;
   protected override closed = false;
   protected override dirty = false;
   protected override sessionsDirty = false;
@@ -1120,10 +1119,6 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     if (this.intervalTimer) {
       clearInterval(this.intervalTimer);
       this.intervalTimer = null;
-    }
-    if (this.memoryWatchPressureStartupTimer) {
-      clearTimeout(this.memoryWatchPressureStartupTimer);
-      this.memoryWatchPressureStartupTimer = null;
     }
     if (this.watcher) {
       await this.watcher.close();

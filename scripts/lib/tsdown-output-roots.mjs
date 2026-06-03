@@ -1,5 +1,6 @@
 const TSDOWN_PACKAGE_NAMES = [
   "agent-core",
+  "chokidar-slim",
   "gateway-client",
   "gateway-protocol",
   "llm-core",
