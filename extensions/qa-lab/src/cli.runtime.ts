@@ -843,7 +843,7 @@ export async function runQaSuiteCommand(opts: QaSuiteCommandOptions) {
       alternateModel,
       allowFailures,
     });
-    return;
+    return undefined;
   }
   const thinkingDefault = parseQaThinkingLevel("--thinking", opts.thinking);
   const runtimeResult = await runQaSuiteWithInfraRetry(() =>
