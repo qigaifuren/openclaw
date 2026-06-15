@@ -67,11 +67,7 @@ import { normalizeIMessageHandle } from "../targets.js";
 import { attachIMessageMonitorAbortHandler } from "./abort-handler.js";
 import { runIMessageCatchup } from "./catchup-bridge.js";
 import { advanceIMessageCatchupCursor, resolveCatchupConfig } from "./catchup.js";
-import {
-  combineIMessagePayloads,
-  hasIMessageBalloonMetadata,
-  shouldCombineIMessagePayloadBucket,
-} from "./coalesce.js";
+import { combineIMessagePayloads } from "./coalesce.js";
 import { repairIMessageConversationAnchor } from "./conversation-repair.js";
 import { createIMessageEchoCachingSend, deliverReplies } from "./deliver.js";
 import { resolveIMessageDmHistoryContext, resolveIMessageDmHistoryLimit } from "./dm-history.js";
@@ -457,24 +453,6 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): P
         : recoveryCursorRowid
       : recoveryBoundaryRowid;
 
-  // When `coalesceSameSenderDms` is enabled and the user has not set an
-  // explicit inbound debounce for this channel, widen the window to 2500 ms.
-  // Apple's split-send for `<command> <URL>` arrives ~0.8-2.0 s apart on most
-  // setups, so the legacy 0 ms default would flush the command alone before
-  // the URL row reaches the debouncer.
-  const coalesceSameSenderDms = imessageCfg.coalesceSameSenderDms === true;
-  const inboundCfg = cfg.messages?.inbound;
-  const hasExplicitInboundDebounce =
-    typeof inboundCfg?.debounceMs === "number" ||
-    typeof inboundCfg?.byChannel?.imessage === "number";
-  const debounceMsOverride =
-    coalesceSameSenderDms && !hasExplicitInboundDebounce ? 2500 : undefined;
-
-  // Session capability latch: flips true once any inbound row from this imsg
-  // build carries balloon metadata. The coalesce flush gate needs a build-level
-  // (not per-bucket) signal because imsg omits `balloon_bundle_id` for plain
-  // rows, so a bucket of plain text looks identical on old and new builds.
-  let imsgEmitsBalloonMetadata = false;
   let recoveryCursorHoldBeforeRowid: number | null = null;
   let latestAdvancedRecoveryCursorRowid = recoveryCursorRowid ?? -1;
   const pendingRecoveryReplayRowids = new Set<number>();
@@ -585,13 +563,12 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): P
     message: IMessagePayload;
     // Exact replay-guard key claimed for this row at ingestion (GUID or, for a
     // GUID-less row, the composite fallback). Carried through so flush commits
-    // or releases the same key it claimed, even after coalescing rewrites the
-    // payload identity. null when the row had no derivable key (fail open).
+    // or releases the same key it claimed, even after a debounce merge rewrites
+    // the payload identity. null when the row had no derivable key (fail open).
     replayKey: string | null;
   }>({
     cfg,
     channel: "imessage",
-    debounceMsOverride,
     buildKey: (entry) => {
       const msg = entry.message;
       const sender = msg.sender?.trim();
@@ -602,14 +579,6 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): P
         msg.chat_id != null
           ? `chat:${msg.chat_id}`
           : (msg.chat_guid ?? msg.chat_identifier ?? "unknown");
-
-      // With coalesceSameSenderDms enabled, DMs key on chat:sender so Apple's
-      // split text row and URL-balloon row land in the same bucket. The flush
-      // path still requires imsg's structural balloon metadata before merging.
-      // Group chats keep the legacy key to preserve multi-user turn structure.
-      if (coalesceSameSenderDms && msg.is_group !== true) {
-        return `imessage:${accountInfo.accountId}:dm:${conversationId}:${sender}`;
-      }
 
       return `imessage:${accountInfo.accountId}:${conversationId}:${sender}`;
     },
@@ -623,15 +592,9 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): P
         return false;
       }
 
-      // Hold opt-in DMs long enough for a following URL-balloon row to arrive.
-      // The flush gate (shouldCombineIMessagePayloadBucket) decides merge vs.
-      // separate: it merges precisely on imsg's balloon marker, and falls back
-      // to a legacy merge only when the build emits no balloon metadata at all.
-      if (coalesceSameSenderDms) {
-        return msg.is_group !== true;
-      }
-
-      // Legacy gate: text-only, no control commands, no media.
+      // General same-sender inbound debounce: text-only, no control commands,
+      // no media. Off by default (messages.inbound debounce is 0 ms unless
+      // configured), matching Discord/Telegram/Slack.
       return shouldDebounceTextInbound({
         text: msg.text,
         cfg,
@@ -644,7 +607,7 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): P
       if (entries.length === 0) {
         return;
       }
-      // Dispatch one unit (a single row or a coalesced bucket), then commit the
+      // Dispatch one unit (a single row or a merged bucket), then commit the
       // exact replay keys that were claimed at ingestion, or release them if
       // dispatch throws so a transient failure can retry on a later re-emit. Per
       // unit so a failure in one bucket entry cannot strand another's claim.
@@ -681,19 +644,14 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): P
       }
 
       const messages = entries.map((e) => e.message);
-      if (!shouldCombineIMessagePayloadBucket(messages, imsgEmitsBalloonMetadata)) {
-        for (const entry of entries) {
-          await dispatchUnit([entry], entry.message);
-        }
-        return;
-      }
-
       const combined = combineIMessagePayloads(messages);
       if (shouldLogVerbose()) {
         const text = combined.text ?? "";
         const preview = text.slice(0, 50);
         const ellipsis = text.length > 50 ? "..." : "";
-        logVerbose(`[imessage] coalesced ${entries.length} messages: "${preview}${ellipsis}"`);
+        logVerbose(
+          `[imessage] merged ${entries.length} debounced messages: "${preview}${ellipsis}"`,
+        );
       }
       await dispatchUnit(entries, combined);
     },
@@ -1331,11 +1289,6 @@ export async function monitorIMessageProvider(opts: MonitorIMessageOpts = {}): P
           : typeof raw;
       runtime.error?.(`imessage: dropping malformed RPC message payload (keys=${shape})`);
       return;
-    }
-    // Latch build capability from any row that carries balloon metadata so the
-    // coalesce flush gate can trust a missing URL marker on later plain buckets.
-    if (!imsgEmitsBalloonMetadata && hasIMessageBalloonMetadata(message)) {
-      imsgEmitsBalloonMetadata = true;
     }
     // Age fence with two windows, split on the recovery boundary:
     //  - rows at/below recoveryBoundaryRowid are the downtime-recovery replay

@@ -1419,7 +1419,6 @@ export const IMessageAccountSchemaBase = z
     blockStreamingCoalesce: BlockStreamingCoalesceSchema.optional(),
     sendReadReceipts: z.boolean().optional(),
     reactionNotifications: z.enum(["off", "own", "all"]).optional(),
-    coalesceSameSenderDms: z.boolean().optional(),
     catchup: z
       .object({
         enabled: z.boolean().optional(),

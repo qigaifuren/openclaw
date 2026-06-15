@@ -38,10 +38,12 @@ const debouncerControl = vi.hoisted(() => ({
   holdEntries: false,
   entries: [] as unknown[],
   flush: undefined as undefined | (() => Promise<void>),
+  flushEach: undefined as undefined | (() => Promise<void>),
   reset() {
     this.holdEntries = false;
     this.entries = [];
     this.flush = undefined;
+    this.flushEach = undefined;
   },
 }));
 
@@ -74,6 +76,15 @@ vi.mock("openclaw/plugin-sdk/channel-inbound", async (importOriginal) => {
           debouncerControl.flush = async () => {
             const entries = debouncerControl.entries.splice(0);
             await opts.onFlush(entries);
+          };
+          // Flush each collected entry as its own single-entry bucket, modeling
+          // the real non-debounced path (shouldDebounceTextInbound is mocked to
+          // false here) where every row dispatches individually.
+          debouncerControl.flushEach = async () => {
+            const entries = debouncerControl.entries.splice(0);
+            for (const queued of entries) {
+              await opts.onFlush([queued]);
+            }
           };
         },
       },
@@ -1204,7 +1215,6 @@ describe("iMessage monitor last-route updates", () => {
                 is_from_me: false,
                 text: `missed during downtime ${id}`,
                 is_group: false,
-                balloon_bundle_id: "com.apple.messages.Handwriting",
                 created_at: thirtyMinAgo,
               },
             },
@@ -1238,7 +1248,7 @@ describe("iMessage monitor last-route updates", () => {
     await vi.waitFor(() => {
       expect(debouncerControl.entries).toHaveLength(2);
     });
-    await debouncerControl.flush?.();
+    await debouncerControl.flushEach?.();
     await vi.waitFor(() => {
       expect(dispatchInboundMessageMock).toHaveBeenCalledTimes(2);
     });
@@ -1277,7 +1287,6 @@ describe("iMessage monitor last-route updates", () => {
                 is_from_me: false,
                 text: `missed during downtime ${id}`,
                 is_group: false,
-                balloon_bundle_id: "com.apple.messages.Handwriting",
                 created_at: thirtyMinAgo,
               },
             },
@@ -1307,7 +1316,7 @@ describe("iMessage monitor last-route updates", () => {
       expect(debouncerControl.entries).toHaveLength(2);
     });
     debouncerControl.entries.reverse();
-    await debouncerControl.flush?.();
+    await debouncerControl.flushEach?.();
     await vi.waitFor(() => {
       expect(dispatchInboundMessageMock).toHaveBeenCalledTimes(2);
     });
@@ -1408,12 +1417,11 @@ describe("iMessage monitor last-route updates", () => {
     expect(dispatchParams?.ctx.To).not.toBe("imessage:+15550001111");
   });
 
-  it("legacy-merges coalesce buckets when imsg emits no balloon metadata (older builds)", async () => {
-    // Back-compat: older imsg builds emit no balloon_bundle_id, so a Dump + URL
-    // split-send arrives as two fieldless rows. We cannot structurally tell that
-    // apart from separate sends, so we preserve the pre-metadata merge rather
-    // than regress split-send users to two turns. Removed once imsg coalesces
-    // upstream (openclaw/imsg#141, tracked by #91243).
+  it("merges rapid same-sender DM rows via the general inbound debounce", async () => {
+    // The general same-sender inbound debounce (messages.inbound, off by
+    // default) buckets rapid text rows and merges them into one agent turn,
+    // matching Discord/Telegram/Slack. Apple URL-preview split-sends are now
+    // coalesced upstream by imsg, so no iMessage-specific opt-in is involved.
     debouncerControl.holdEntries = true;
 
     let onNotification: ((message: { method: string; params: unknown }) => void) | undefined;
@@ -1426,18 +1434,18 @@ describe("iMessage monitor last-route updates", () => {
       }),
       waitForClose: vi.fn(async () => {
         // Fresh dates relative to now so the stale-backlog age fence lets the
-        // live split-send through to the coalescer.
+        // live rows through to the debouncer.
         for (const row of [
           {
             id: 91,
             guid: "LIVE-GUID-91",
-            text: "Dump",
+            text: "first thought",
             created_at: new Date(Date.now() - 2000).toISOString(),
           },
           {
             id: 92,
             guid: "LIVE-GUID-92",
-            text: "https://example.com",
+            text: "second thought",
             created_at: new Date(Date.now() - 1000).toISOString(),
           },
         ]) {
@@ -1474,7 +1482,6 @@ describe("iMessage monitor last-route updates", () => {
       config: {
         channels: {
           imessage: {
-            coalesceSameSenderDms: true,
             dmPolicy: "allowlist",
             allowFrom: ["+15550001111"],
             sendReadReceipts: false,
@@ -1488,87 +1495,7 @@ describe("iMessage monitor last-route updates", () => {
 
     expect(dispatchInboundMessageMock).toHaveBeenCalledTimes(1);
     const mergedBody = dispatchInboundMessageMock.mock.calls[0]?.[0].ctx.Body ?? "";
-    expect(mergedBody).toContain("Dump");
-    expect(mergedBody).toContain("https://example.com");
-  });
-
-  it("merges coalesce buckets when imsg marks the URL balloon row structurally", async () => {
-    debouncerControl.holdEntries = true;
-
-    let onNotification: ((message: { method: string; params: unknown }) => void) | undefined;
-    const client = {
-      request: vi.fn(async (method: string) => {
-        if (method === "watch.subscribe") {
-          return { subscription: 1 };
-        }
-        throw new Error(`unexpected imsg method ${method}`);
-      }),
-      waitForClose: vi.fn(async () => {
-        // Fresh dates relative to now so the stale-backlog age fence lets the
-        // live split-send through to the coalescer.
-        for (const row of [
-          {
-            id: 93,
-            guid: "LIVE-GUID-93",
-            text: "Dump",
-            created_at: new Date(Date.now() - 2000).toISOString(),
-          },
-          {
-            id: 94,
-            guid: "LIVE-GUID-94",
-            text: "https://example.com",
-            balloon_bundle_id: "com.apple.messages.URLBalloonProvider",
-            created_at: new Date(Date.now() - 1000).toISOString(),
-          },
-        ]) {
-          onNotification?.({
-            method: "message",
-            params: {
-              message: {
-                ...row,
-                chat_id: 123,
-                sender: "+15550001111",
-                is_from_me: false,
-                is_group: false,
-              },
-            },
-          });
-        }
-        await vi.waitFor(() => {
-          expect(debouncerControl.flush).toBeDefined();
-        });
-        await debouncerControl.flush?.();
-        await Promise.resolve();
-      }),
-      stop: vi.fn(async () => {}),
-    };
-    createIMessageRpcClientMock.mockImplementation(async (params) => {
-      if (!params?.onNotification) {
-        throw new Error("expected iMessage notification handler");
-      }
-      onNotification = params.onNotification;
-      return client as never;
-    });
-
-    await monitorIMessageProvider({
-      config: {
-        channels: {
-          imessage: {
-            coalesceSameSenderDms: true,
-            dmPolicy: "allowlist",
-            allowFrom: ["+15550001111"],
-            sendReadReceipts: false,
-          },
-        },
-        messages: { inbound: { debounceMs: 2500 } },
-        session: { mainKey: "main" },
-      } as never,
-      runtime: { error: vi.fn(), exit: vi.fn(), log: vi.fn() },
-    });
-
-    expect(dispatchInboundMessageMock).toHaveBeenCalledTimes(1);
-    expect(dispatchInboundMessageMock.mock.calls[0]?.[0].ctx.Body).toContain(
-      "Dump https://example.com",
-    );
+    expect(mergedBody).toContain("first thought");
+    expect(mergedBody).toContain("second thought");
   });
 });

@@ -59,7 +59,7 @@ Config (global default + per-channel overrides):
 Notes:
 
 - Debounce applies to **text-only** messages; media/attachments flush immediately.
-- Control commands bypass debouncing so they remain standalone. Channels that explicitly opt in to same-sender DM coalescing can keep DM commands inside the debounce window so a split-send payload can join the same agent turn.
+- Control commands bypass debouncing so they remain standalone.
 
 ## Sessions and devices
 

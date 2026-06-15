@@ -34,6 +34,26 @@ function imessageEntryHasRetiredCatchup(entry: unknown): boolean {
   );
 }
 
+// `channels.imessage.coalesceSameSenderDms` is retired. imsg (>= 0.11.1)
+// coalesces Apple's URL-preview split-sends upstream, so the client-side
+// debounce-and-merge opt-in is dead config and must be dropped from existing
+// `openclaw.json` files. Removable at the imessage entry root and per account.
+function imessageEntryHasRetiredCoalesce(entry: unknown): boolean {
+  if (!isRecord(entry)) {
+    return false;
+  }
+  if (Object.hasOwn(entry, "coalesceSameSenderDms")) {
+    return true;
+  }
+  const accounts = entry.accounts;
+  if (!isRecord(accounts)) {
+    return false;
+  }
+  return Object.values(accounts).some(
+    (account) => isRecord(account) && Object.hasOwn(account, "coalesceSameSenderDms"),
+  );
+}
+
 export const legacyConfigRules: ChannelDoctorLegacyConfigRule[] = [
   {
     path: ["channels", "imessage"],
@@ -41,6 +61,13 @@ export const legacyConfigRules: ChannelDoctorLegacyConfigRule[] = [
       "disabled channels.imessage.catchup config is retired; iMessage now recovers via always-on inbound dedupe and a stale-backlog age fence. " +
       'Run "openclaw doctor --fix" to remove disabled catchup blocks.',
     match: (value) => imessageEntryHasRetiredCatchup(value),
+  },
+  {
+    path: ["channels", "imessage"],
+    message:
+      "channels.imessage.coalesceSameSenderDms is retired; imsg (>= 0.11.1) coalesces Apple URL-preview split-sends upstream. " +
+      'Run "openclaw doctor --fix" to remove the stale key.',
+    match: (value) => imessageEntryHasRetiredCoalesce(value),
   },
 ];
 
@@ -51,7 +78,10 @@ export function normalizeCompatibilityConfig({
 }): ChannelDoctorConfigMutation {
   const channels = cfg.channels as Record<string, unknown> | undefined;
   const imessage = channels?.imessage;
-  if (!imessageEntryHasRetiredCatchup(imessage) || !isRecord(imessage)) {
+  if (
+    (!imessageEntryHasRetiredCatchup(imessage) && !imessageEntryHasRetiredCoalesce(imessage)) ||
+    !isRecord(imessage)
+  ) {
     return { config: cfg, changes: [] };
   }
   const changes: string[] = [];
@@ -60,21 +90,34 @@ export function normalizeCompatibilityConfig({
     delete nextImessage.catchup;
     changes.push("Removed disabled retired channels.imessage.catchup.");
   }
+  if (Object.hasOwn(nextImessage, "coalesceSameSenderDms")) {
+    delete nextImessage.coalesceSameSenderDms;
+    changes.push("Removed retired channels.imessage.coalesceSameSenderDms.");
+  }
   if (isRecord(nextImessage.accounts)) {
     let accountsChanged = false;
     const nextAccounts: Record<string, unknown> = { ...nextImessage.accounts };
     for (const [id, account] of Object.entries(nextImessage.accounts)) {
-      if (
-        isRecord(account) &&
-        Object.hasOwn(account, "catchup") &&
-        !isEnabledCatchup(account.catchup)
-      ) {
-        const nextAccount = { ...account };
+      if (!isRecord(account)) {
+        continue;
+      }
+      const hasRetiredCatchup =
+        Object.hasOwn(account, "catchup") && !isEnabledCatchup(account.catchup);
+      const hasRetiredCoalesce = Object.hasOwn(account, "coalesceSameSenderDms");
+      if (!hasRetiredCatchup && !hasRetiredCoalesce) {
+        continue;
+      }
+      const nextAccount = { ...account };
+      if (hasRetiredCatchup) {
         delete nextAccount.catchup;
-        nextAccounts[id] = nextAccount;
-        accountsChanged = true;
         changes.push(`Removed disabled retired channels.imessage.accounts.${id}.catchup.`);
       }
+      if (hasRetiredCoalesce) {
+        delete nextAccount.coalesceSameSenderDms;
+        changes.push(`Removed retired channels.imessage.accounts.${id}.coalesceSameSenderDms.`);
+      }
+      nextAccounts[id] = nextAccount;
+      accountsChanged = true;
     }
     if (accountsChanged) {
       nextImessage.accounts = nextAccounts;
